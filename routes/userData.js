@@ -9,11 +9,10 @@ import authenticateFirebaseUser from "../middleware/googleAuth.js";
 import { uploadToGoogleDrive } from "../config/googleDrive.js";
 import { UserData } from "../models/userModel.js";
 
-
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const routerUserData = express.Router();
 
-// Multer storage settings
+// Multer Storage Settings
 const storage = multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
@@ -21,69 +20,44 @@ const storage = multer.diskStorage({
     },
 });
 
-// File filter for video formats
-const fileFilter = (req, file, cb) => {
-    const allowedTypes = ["video/mp4", "video/x-msvideo", "video/quicktime"];
-    allowedTypes.includes(file.mimetype) ? cb(null, true) : cb(new Error("Invalid file type"), false);
-};
-
-const upload = multer({ storage, fileFilter });
+const upload = multer({ storage });
 
 /**
- * Compress video using FFmpeg before sending to Flask API
- * - Reduces resolution to 640px width (maintains aspect ratio)
- * - Lowers bitrate to 800k for compression
- * - Converts to MP4 format
+ * Compress Video Before Uploading
  */
 const compressVideo = (inputPath, outputPath) => {
     return new Promise((resolve, reject) => {
         ffmpeg(inputPath)
-            .videoCodec("libx264")  // H.264 codec
-            .audioCodec("aac")       // AAC audio
-            .audioBitrate("128k")    // Set audio bitrate
-            .videoBitrate("1000k")   // Set video bitrate
+            .videoCodec("libx264")
+            .audioCodec("aac")
+            .audioBitrate("128k")
+            .videoBitrate("1000k")
             .outputOptions([
-                "-preset fast",  // Speed-optimized compression
-                "-crf 28",       // Compression level (28 is a good balance)
-                "-vf", "scale=640:-2:flags=lanczos",  // Resize width to 640px while maintaining aspect ratio
-                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"  // Ensure dimensions are even
+                "-preset fast",
+                "-crf 28",
+                "-vf", "scale=640:-2:flags=lanczos",
+                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"
             ])
-            .format("mp4") 
-            .on("end", () => {
-                console.log("✅ Compression successful:", outputPath);
-                resolve();
-            })
-            .on("error", (err) => {
-                console.error("❌ FFmpeg Compression Error:", err);
-                reject(err);
-            })
+            .format("mp4")
+            .on("end", () => resolve())
+            .on("error", (err) => reject(err))
             .save(outputPath);
     });
 };
 
-
-
-// Route to upload video, compress it, send to Flask API, and upload to Google Drive
-routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), async (req, res) => {
-    try {
-        if (!req.file) return res.status(400).json({ message: "No file uploaded or invalid format" });
-
+/**
+ * Handlers for Different File Types
+ */
+const handlers = {
+    "video": async (req, res, inputPath) => {
         const { email } = req.user;
-        const inputPath = req.file.path;
         const compressedPath = `uploads/compressed_${req.file.filename}`;
 
         console.log(`Compressing video: ${inputPath}`);
-
-        // Compress the video
         await compressVideo(inputPath, compressedPath);
-
-        // ✅ Unlink (delete) original file after compression
         fs.unlinkSync(inputPath);
-        console.log(`Original file deleted: ${inputPath}`);
 
-        console.log("Compression complete. Sending to Flask API...");
-
-        // Send the compressed video to Flask API for detection
+        console.log("Sending video to Flask API...");
         const formData = new FormData();
         formData.append("file", fs.createReadStream(compressedPath));
 
@@ -98,44 +72,91 @@ routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), 
             return res.status(500).json({ message: "Flask API failed, upload canceled" });
         }
 
-        if (flaskResponse.status !== 200) {
-            fs.unlinkSync(compressedPath);
-            return res.status(500).json({ message: "Unexpected Flask API response" });
-        }
-
         const { score, is_deepfake } = flaskResponse.data;
-        console.log("Flask API response received. Uploading to Google Drive...");
 
-        // Upload the compressed video to Google Drive
         const fileUrl = await uploadToGoogleDrive({ path: compressedPath, originalname: req.file.filename });
+        fs.unlinkSync(compressedPath);
 
-        console.log("Upload to Google Drive complete. Saving data to DB...");
-
-        // Save to MongoDB
         await UserData.findOneAndUpdate(
             { email },
             { $push: { files: { fileName: req.file.originalname, fileUrl, score, is_deepfake } } },
             { upsert: true, new: true }
         );
 
-        // ✅ Unlink compressed file after successful upload
-        fs.unlinkSync(compressedPath);
-        console.log(`Compressed file deleted: ${compressedPath}`);
-
         return res.status(200).json({
-            message: "File compressed, uploaded & link saved",
+            message: "Video processed & uploaded",
             fileName: req.file.originalname,
             fileUrl,
             score,
             is_deepfake,
         });
+    },
 
+    "image": async (req, res, inputPath) => {
+        const { email } = req.user;
+        console.log("Sending image to Image Processing API...");
+
+        const formData = new FormData();
+        formData.append("file", fs.createReadStream(inputPath));
+
+        try {
+            const imageResponse = await axios.post(`${process.env.IMAGE_API_URL}/detect`, formData, {
+                headers: { ...formData.getHeaders() },
+                timeout: 30000,
+            });
+
+            if (imageResponse.status !== 200) throw new Error("Image API failed");
+
+            const { is_deepfake, probability } = imageResponse.data;
+            const fileUrl = await uploadToGoogleDrive({ path: inputPath, originalname: req.file.filename });
+            fs.unlinkSync(inputPath);
+
+            await UserData.findOneAndUpdate(
+                { email },
+                { $push: { files: { fileName: req.file.originalname, fileUrl, is_deepfake, score: probability } } },
+                { upsert: true, new: true }
+            );
+
+            return res.status(200).json({
+                message: "Image processed & uploaded",
+                fileName: req.file.originalname,
+                fileUrl,
+                is_deepfake,
+                score: probability,
+            });
+
+        } catch (error) {
+            fs.unlinkSync(inputPath);
+            return res.status(500).json({ message: "Image processing failed", error: error.message });
+        }
+    }
+};
+
+/**
+ * Upload Route
+ */
+routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ message: "No file uploaded or invalid format" });
+
+        const inputPath = req.file.path;
+        const fileType = req.file.mimetype.split("/")[0]; // Get 'video' or 'image'
+        console.log(`Processing file: ${req.file.originalname}, Type: ${fileType}`);
+
+        // Choose the correct handler dynamically
+        const handler = handlers[fileType];
+        console.log(handler)
+        if (!handler) {
+            fs.unlinkSync(inputPath);
+            return res.status(400).json({ message: "Unsupported file type" });
+        }
+
+        await handler(req, res, inputPath);
     } catch (err) {
-        console.error("Error in video processing:", err);
+        console.error("Error in file processing:", err);
         res.status(500).json({ message: "Error uploading file" });
     }
 });
-
 
 // Route to get user-uploaded videos
 routerUserData.get("/", authenticateFirebaseUser, async (req, res) => {
