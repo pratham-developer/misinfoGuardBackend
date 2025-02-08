@@ -17,7 +17,7 @@ const routerUserData = express.Router();
 const storage = multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
-        cb(null, Date.now() + "_" + file.originalname);
+        cb(null, file.originalname);
     },
 });
 
@@ -114,7 +114,7 @@ routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), 
         // Save to MongoDB
         await UserData.findOneAndUpdate(
             { email },
-            { $push: { files: { fileUrl, score, is_deepfake } } },
+            { $push: { files: { fileName: req.file.originalname, fileUrl, score, is_deepfake } } },
             { upsert: true, new: true }
         );
 
@@ -124,6 +124,7 @@ routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), 
 
         return res.status(200).json({
             message: "File compressed, uploaded & link saved",
+            fileName: req.file.originalname,
             fileUrl,
             score,
             is_deepfake,

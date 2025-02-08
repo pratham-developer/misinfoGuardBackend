@@ -13,7 +13,7 @@ const userDataSchema = new mongoose.Schema(
     {
         email: { type: String, required: true, unique: true, ref: "User" },
         files: [
-            {
+            {   fileName: {type: String, required: true},
                 fileUrl: { type: String, required: true },
                 score: { type: Number, required: true },
                 is_deepfake: { type: Boolean, required: true }
