@@ -1,10 +1,12 @@
 import express from "express";
 import multer from "multer";
-import fs from "fs";
+import fs from "fs"; // ✅ Supports createReadStream
+import { promises as fsPromises } from "fs"; // ✅ Use this for async operations like unlink
 import axios from "axios";
 import FormData from "form-data";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import sharp from "sharp";
 import authenticateFirebaseUser from "../middleware/googleAuth.js";
 import { uploadToGoogleDrive } from "../config/googleDrive.js";
 import { UserData } from "../models/userModel.js";
@@ -23,7 +25,23 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 /**
- * Compress Video Before Uploading
+ * ✅ Utility: Wait for File to Exist Before Processing
+ */
+const waitForFile = async (path, retries = 5, delay = 500) => {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await fsPromises.access(path);
+            return true; // ✅ File exists
+        } catch (error) {
+            console.log(`🔄 File not found, retrying... (${i + 1})`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+    }
+    throw new Error(`❌ File not found after ${retries} retries: ${path}`);
+};
+
+/**
+ * 📹 Compress Video Before Uploading
  */
 const compressVideo = (inputPath, outputPath) => {
     return new Promise((resolve, reject) => {
@@ -35,8 +53,7 @@ const compressVideo = (inputPath, outputPath) => {
             .outputOptions([
                 "-preset fast",
                 "-crf 28",
-                "-vf", "scale=640:-2:flags=lanczos",
-                "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+                "-vf", "scale=640:-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2"
             ])
             .format("mp4")
             .on("end", () => resolve())
@@ -46,20 +63,37 @@ const compressVideo = (inputPath, outputPath) => {
 };
 
 /**
- * Handlers for Different File Types
+ * 🖼️ Compress Image Before Uploading
+ */
+const compressImage = async (inputPath, outputPath) => {
+    try {
+        await fsPromises.access(inputPath); // ✅ Ensure file exists
+        await sharp(inputPath)
+            .resize({ width: 800 })
+            .jpeg({ quality: 75 })
+            .toFile(outputPath);
+        console.log("✅ Image compression successful:", outputPath);
+    } catch (err) {
+        console.error("❌ Error in image processing:", err);
+        throw err;
+    }
+};
+
+/**
+ * 🔹 Handlers for Different File Types
  */
 const handlers = {
     "video": async (req, res, inputPath) => {
         const { email } = req.user;
         const compressedPath = `uploads/compressed_${req.file.filename}`;
 
-        console.log(`Compressing video: ${inputPath}`);
+        console.log(`📹 Compressing video: ${inputPath}`);
         await compressVideo(inputPath, compressedPath);
-        fs.unlinkSync(inputPath);
+        await fsPromises.unlink(inputPath); // ✅ Delete original file
 
-        console.log("Sending video to Flask API...");
+        console.log("📡 Sending video to Flask API...");
         const formData = new FormData();
-        formData.append("file", fs.createReadStream(compressedPath));
+        formData.append("file", fs.createReadStream(compressedPath)); // ✅ Now works
 
         let flaskResponse;
         try {
@@ -68,14 +102,14 @@ const handlers = {
                 timeout: 30000,
             });
         } catch (flaskError) {
-            fs.unlinkSync(compressedPath);
+            await fsPromises.unlink(compressedPath);
             return res.status(500).json({ message: "Flask API failed, upload canceled" });
         }
 
         const { score, is_deepfake } = flaskResponse.data;
 
         const fileUrl = await uploadToGoogleDrive({ path: compressedPath, originalname: req.file.filename });
-        fs.unlinkSync(compressedPath);
+        await fsPromises.unlink(compressedPath);
 
         await UserData.findOneAndUpdate(
             { email },
@@ -84,7 +118,7 @@ const handlers = {
         );
 
         return res.status(200).json({
-            message: "Video processed & uploaded",
+            message: "✅ Video processed & uploaded",
             fileName: req.file.originalname,
             fileUrl,
             score,
@@ -94,10 +128,15 @@ const handlers = {
 
     "image": async (req, res, inputPath) => {
         const { email } = req.user;
-        console.log("Sending image to Image Processing API...");
+        const compressedPath = `uploads/compressed_${req.file.filename}`;
 
+        console.log(`🖼️ Compressing image: ${inputPath}`);
+        await compressImage(inputPath, compressedPath);
+        await fsPromises.unlink(inputPath); // ✅ Delete original file
+
+        console.log("📡 Sending image to Image Processing API...");
         const formData = new FormData();
-        formData.append("file", fs.createReadStream(inputPath));
+        formData.append("file", fs.createReadStream(compressedPath)); // ✅ Now works
 
         try {
             const imageResponse = await axios.post(`${process.env.IMAGE_API_URL}/detect`, formData, {
@@ -108,8 +147,9 @@ const handlers = {
             if (imageResponse.status !== 200) throw new Error("Image API failed");
 
             const { is_deepfake, probability } = imageResponse.data;
-            const fileUrl = await uploadToGoogleDrive({ path: inputPath, originalname: req.file.filename });
-            fs.unlinkSync(inputPath);
+
+            const fileUrl = await uploadToGoogleDrive({ path: compressedPath, originalname: req.file.filename });
+            await fsPromises.unlink(compressedPath);
 
             await UserData.findOneAndUpdate(
                 { email },
@@ -118,7 +158,7 @@ const handlers = {
             );
 
             return res.status(200).json({
-                message: "Image processed & uploaded",
+                message: "✅ Image processed & uploaded",
                 fileName: req.file.originalname,
                 fileUrl,
                 is_deepfake,
@@ -126,14 +166,14 @@ const handlers = {
             });
 
         } catch (error) {
-            fs.unlinkSync(inputPath);
-            return res.status(500).json({ message: "Image processing failed", error: error.message });
+            await fsPromises.unlink(compressedPath);
+            return res.status(500).json({ message: "❌ Image processing failed", error: error.message });
         }
     }
 };
 
 /**
- * Upload Route
+ * 🚀 Upload Route
  */
 routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), async (req, res) => {
     try {
@@ -141,19 +181,21 @@ routerUserData.post("/upload", authenticateFirebaseUser, upload.single("file"), 
 
         const inputPath = req.file.path;
         const fileType = req.file.mimetype.split("/")[0]; // Get 'video' or 'image'
-        console.log(`Processing file: ${req.file.originalname}, Type: ${fileType}`);
 
-        // Choose the correct handler dynamically
+        console.log(`📂 Processing file: ${req.file.originalname}, Type: ${fileType}`);
+
+        // ✅ Wait for file before processing
+        await waitForFile(inputPath);
+
         const handler = handlers[fileType];
-        console.log(handler)
         if (!handler) {
-            fs.unlinkSync(inputPath);
+            await fsPromises.unlink(inputPath);
             return res.status(400).json({ message: "Unsupported file type" });
         }
 
         await handler(req, res, inputPath);
     } catch (err) {
-        console.error("Error in file processing:", err);
+        console.error("❌ Error in file processing:", err);
         res.status(500).json({ message: "Error uploading file" });
     }
 });
